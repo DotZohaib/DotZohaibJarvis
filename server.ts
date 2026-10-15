@@ -299,11 +299,12 @@ async function startServer() {
       "http://localhost:5173",
       "http://127.0.0.1:3000",
     ].filter(Boolean);
+    const origin = _req.headers.origin || "";
     if (
       allowedOrigins.length === 0 ||
       allowedOrigins.includes(origin) ||
       process.env.NODE_ENV !== "production" ||
-      origin.endsWith(".vercel.app")
+      (origin && origin.endsWith(".vercel.app"))
     ) {
       res.setHeader("Access-Control-Allow-Origin", origin || "*");
     }
@@ -326,6 +327,36 @@ async function startServer() {
         ? "JARVIS Live neural link ready."
         : "GEMINI_API_KEY is missing. Please configure GEMINI_API_KEY in the environment / Secrets panel.",
     });
+  });
+
+  // Direct REST API for Gemini Live Ephemeral Token generation
+  app.all("/api/session", async (_req, res) => {
+    if (!isApiKeyConfigured()) {
+      return res.status(401).json({
+        success: false,
+        code: "MISSING_API_KEY",
+        error: "GEMINI_API_KEY is missing. Please configure GEMINI_API_KEY in your environment.",
+      });
+    }
+
+    try {
+      const ai = createGenAIClient();
+      const tokenRes = await ai.authTokens.create({});
+      const token = (tokenRes.name || "").replace(/^auth_tokens\//, "");
+      return res.json({
+        success: true,
+        token,
+        model: "models/gemini-3.8-live",
+        endpoint: `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContentConstrained?access_token=${token}`,
+      });
+    } catch (err: any) {
+      console.error("[SERVER /api/session ERROR]", err);
+      return res.status(500).json({
+        success: false,
+        code: "SESSION_CREATION_FAILED",
+        error: err?.message || "Failed to create ephemeral session token.",
+      });
+    }
   });
 
   // Direct REST API for live weather lookup

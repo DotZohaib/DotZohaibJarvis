@@ -14,6 +14,10 @@ import {
   getBackendApiUrl,
   getBackendConnectionHelpText,
 } from "../services/backendConfig";
+import {
+  GEMINI_TOOLS,
+  JARVIS_SYSTEM_INSTRUCTION,
+} from "../services/geminiLiveConfig";
 
 function getLiveWsUrl(voice: string): string {
   return getBackendWsUrl(`/live?voice=${encodeURIComponent(voice)}`);
@@ -129,6 +133,7 @@ export function useJarvisLive() {
   const thinkingTimeoutRef = useRef<number | null>(null);
   const silenceTimerRef = useRef<number | null>(null);
   const isManualDisconnectRef = useRef<boolean>(false);
+  const isDirectGoogleLiveRef = useRef<boolean>(false);
 
   // Web Audio API refs
   const mediaStreamRef = useRef<MediaStream | null>(null);
@@ -355,7 +360,22 @@ export function useJarvisLive() {
           );
 
           // Continuously stream real-time 16kHz PCM audio to Gemini 3.8 Live
-          ws.send(JSON.stringify({ type: "audio", audio: base64 }));
+          if (isDirectGoogleLiveRef.current) {
+            ws.send(
+              JSON.stringify({
+                realtimeInput: {
+                  mediaChunks: [
+                    {
+                      mimeType: "audio/pcm;rate=16000",
+                      data: base64,
+                    },
+                  ],
+                },
+              })
+            );
+          } else {
+            ws.send(JSON.stringify({ type: "audio", audio: base64 }));
+          }
 
           // Automatic Voice Activity Detection (VAD) for responsive state feedback
           const now = performance.now();
@@ -467,23 +487,39 @@ export function useJarvisLive() {
     setErrorCode(null);
     setErrorMessage(null);
 
-    // 1. Check backend configuration first
+    // 1. Resolve session endpoint (Direct Ephemeral Token vs Bridge)
+    let targetWsUrl: string;
+    let isDirect = false;
+
     try {
-      const statusRes = await fetch(getStatusUrl());
-      if (statusRes.ok) {
-        const statusData = await statusRes.json();
-        if (!statusData.configured) {
+      const sessionRes = await fetch(getBackendApiUrl("/api/session"), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+      });
+
+      if (sessionRes.ok) {
+        const sessionData = await sessionRes.json();
+        if (sessionData.success && sessionData.endpoint) {
+          targetWsUrl = sessionData.endpoint;
+          isDirect = true;
+        } else {
+          targetWsUrl = getLiveWsUrl(voiceNameRef.current);
+        }
+      } else {
+        const errJson = await sessionRes.json().catch(() => ({}));
+        if (errJson.code === "MISSING_API_KEY") {
           setErrorCode("MISSING_API_KEY");
           setErrorMessage(
-            statusData.message ||
-              "GEMINI_API_KEY is missing. Configure your key in Settings > Secrets."
+            errJson.error ||
+              "GEMINI_API_KEY is not configured in Vercel Environment Variables. Please add GEMINI_API_KEY in your Vercel Project Settings."
           );
           updateState("ERROR");
           return;
         }
+        targetWsUrl = getLiveWsUrl(voiceNameRef.current);
       }
     } catch {
-      // Proceed to WebSocket connection attempt
+      targetWsUrl = getLiveWsUrl(voiceNameRef.current);
     }
 
     // 2. Initialize microphone & Web Audio pipeline
@@ -492,7 +528,7 @@ export function useJarvisLive() {
       return;
     }
 
-    // 3. Open WebSocket to /live
+    // 3. Open WebSocket
     if (wsRef.current) {
       try {
         wsRef.current.onclose = null;
@@ -502,26 +538,154 @@ export function useJarvisLive() {
       }
     }
 
-    const wsUrl = getLiveWsUrl(voiceNameRef.current);
-    const ws = new WebSocket(wsUrl);
+    isDirectGoogleLiveRef.current = isDirect;
+    const ws = new WebSocket(targetWsUrl);
     wsRef.current = ws;
 
     ws.onopen = () => {
       reconnectAttemptsRef.current = 0;
-      if (pingIntervalRef.current) {
-        window.clearInterval(pingIntervalRef.current);
-      }
-      pingIntervalRef.current = window.setInterval(() => {
-        if (ws.readyState === WebSocket.OPEN) {
-          ws.send(JSON.stringify({ type: "ping" }));
+      if (isDirectGoogleLiveRef.current) {
+        const setupPayload = {
+          setup: {
+            model: "models/gemini-3.8-live",
+            generationConfig: {
+              responseModalities: ["AUDIO"],
+              speechConfig: {
+                voiceConfig: {
+                  prebuiltVoiceConfig: {
+                    voiceName: voiceNameRef.current,
+                  },
+                },
+              },
+            },
+            systemInstruction: {
+              parts: [{ text: JARVIS_SYSTEM_INSTRUCTION }],
+            },
+            tools: GEMINI_TOOLS,
+          },
+        };
+        ws.send(JSON.stringify(setupPayload));
+      } else {
+        if (pingIntervalRef.current) {
+          window.clearInterval(pingIntervalRef.current);
         }
-      }, 20000);
+        pingIntervalRef.current = window.setInterval(() => {
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: "ping" }));
+          }
+        }, 20000);
+      }
     };
 
     ws.onmessage = (event) => {
       try {
         const msg = JSON.parse(event.data);
 
+        // ── Direct Google Gemini Live Protocol ───────────────────
+        if (isDirectGoogleLiveRef.current) {
+          if (msg.setupComplete) {
+            setErrorCode(null);
+            setErrorMessage(null);
+            updateState("READY");
+            window.setTimeout(() => {
+              if (systemStateRef.current === "READY") {
+                updateState("LISTENING");
+              }
+            }, 900);
+            return;
+          }
+
+          if (msg.serverContent) {
+            const sc = msg.serverContent;
+            if (sc.interrupted) {
+              stopAllPlayback();
+              finalizeCurrentTranscripts();
+              updateState("LISTENING");
+            }
+
+            if (sc.modelTurn?.parts) {
+              for (const part of sc.modelTurn.parts) {
+                if (part.inlineData?.data) {
+                  isUserSpeakingRef.current = false;
+                  scheduleAudioChunk(part.inlineData.data);
+                }
+                if (part.text) {
+                  appendTranscript("jarvis", part.text, false);
+                }
+              }
+            }
+
+            if (sc.turnComplete) {
+              finalizeCurrentTranscripts();
+              if (!isJarvisPlayingRef.current && activeSourcesRef.current.size === 0) {
+                updateState("LISTENING");
+              }
+            }
+          }
+
+          if (msg.toolCall?.functionCalls) {
+            for (const call of msg.toolCall.functionCalls) {
+              console.log(
+                `[JARVIS CLIENT] Executing direct tool call "${call.name}" (id: ${call.id})`,
+                call.args
+              );
+              executeTool(call.name, (call.args || {}) as Record<string, any>, {
+                requestId: call.id,
+                source: "gemini_tool_call",
+                openInNewTab: true,
+              })
+                .then((res) => {
+                  if (res.confirmationText) {
+                    appendTranscript("jarvis", res.confirmationText, true);
+                  }
+                  if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+                    wsRef.current.send(
+                      JSON.stringify({
+                        toolResponse: {
+                          functionResponses: [
+                            {
+                              response: {
+                                output: res.data || {
+                                  success: res.success,
+                                  confirmationText: res.confirmationText,
+                                  error: res.error,
+                                },
+                              },
+                              id: call.id,
+                            },
+                          ],
+                        },
+                      })
+                    );
+                  }
+                })
+                .catch((err) => {
+                  if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+                    wsRef.current.send(
+                      JSON.stringify({
+                        toolResponse: {
+                          functionResponses: [
+                            {
+                              response: {
+                                output: {
+                                  success: false,
+                                  error: err?.message || "Execution exception",
+                                },
+                              },
+                              id: call.id,
+                            },
+                          ],
+                        },
+                      })
+                    );
+                  }
+                });
+            }
+          }
+          return;
+        }
+
+        // ── Bridge Server Protocol ───────────────────────────────
         switch (msg.type) {
           case "connected": {
             setErrorCode(null);
